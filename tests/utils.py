@@ -77,6 +77,80 @@ def require_cuda(func):
     return wrapper
 
 
+def cuda_total_vram_gib() -> float:
+    """Report the total VRAM of the current CUDA device.
+
+    Returns:
+        Total device memory in GiB, or ``0.0`` when CUDA is unavailable.
+    """
+    if not torch.cuda.is_available():
+        return 0.0
+    return torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 1024**3
+
+
+def require_vram_gib(min_gib: float):
+    """Build a decorator that skips a test unless the CUDA device is big enough.
+
+    Deliberately a call-time decorator rather than a `pytest.mark.skipif`
+    whose condition is evaluated at import: reading device properties
+    initializes a CUDA context, and the gating CPU run (`-n auto`) imports
+    every test module in every xdist worker. On a GPU box that would spawn one
+    context per worker for tests that are deselected anyway.
+
+    Args:
+        min_gib: Total VRAM the card must have, in GiB. This is the card size
+            required, not the test's peak allocation: the conftest
+            `release_cuda_memory_after_gpu_test` fixture keeps peaks from
+            accumulating across tests, but the floor still has to cover the
+            CUDA context and allocator fragmentation on top of that peak.
+
+    Returns:
+        A decorator that skips the wrapped test when the device is smaller.
+    """
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            available = cuda_total_vram_gib()
+            if available < min_gib:
+                pytest.skip(f"requires >= {min_gib} GiB VRAM (device has {available:.1f} GiB)")
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def to_cuda_bf16(batch: dict, device: str = "cuda") -> dict:
+    """Move a test batch to ``device``, casting only its float tensors to bfloat16.
+
+    A blanket ``.to(dtype=torch.bfloat16)`` over the whole batch silently
+    rewrites the dtype of everything a real dataloader emits as bool or int:
+    ``*_is_pad`` masks become floats and the model fails on `~mask` (bitwise-not
+    is integer/bool only), while integer fields get rounded — the dataloader
+    emits ``speed``/``quality`` as ``torch.long`` and ``mistake`` as
+    ``torch.bool``, so casting them changes what ``prepare_metadata``
+    stringifies. Preserving every non-floating dtype keeps the batch shaped like
+    the real thing and keeps a future token-id tensor safe from the same
+    rounding.
+
+    Args:
+        batch: Batch dict; tensor values are moved and cast, everything else
+            (prompt strings, metadata lists) passes through untouched.
+        device: Target device for the tensor values.
+
+    Returns:
+        A new dict with floating-point tensors cast to bfloat16 on ``device``
+        and every other tensor moved with its dtype intact.
+    """
+    return {
+        key: value.to(device, non_blocking=True, dtype=torch.bfloat16 if value.is_floating_point() else None)
+        if isinstance(value, torch.Tensor)
+        else value
+        for key, value in batch.items()
+    }
+
+
 def require_env(func):
     """
     Decorator that skips the test if the required environment package is not installed.
