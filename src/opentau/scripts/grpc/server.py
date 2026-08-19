@@ -56,7 +56,7 @@ import traceback
 from concurrent import futures
 from dataclasses import asdict
 from pprint import pformat
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator
 
 import numpy as np
 import torch
@@ -127,6 +127,12 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         # Serializes `sample_actions` with the `last_accel` read that follows it. Only
         # taken when accel is enabled; see `GetActionChunk` for why the pair must be atomic.
         self._accel_lock = threading.Lock()
+        # torch.compile CUDA graphs store TLS on the thread that first runs the
+        # compiled fn. gRPC handlers use a ThreadPoolExecutor, so warmup and
+        # every later sample_actions must share one dedicated thread — otherwise
+        # the first real request dies in cudagraph_trees with a bare
+        # AssertionError (empty str → "Inference error: ").
+        self._infer_executor = futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="policy-infer")
 
         logger.info(f"Initializing policy on device: {self.device}")
 
@@ -291,6 +297,36 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         self._replan_event.set()
         if self._planner_thread is not None:
             self._planner_thread.join(timeout=5)
+        executor = getattr(self, "_infer_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False)
+
+    def _sample_actions_sync(
+        self,
+        batch: dict[str, Any],
+        action_prefix: torch.Tensor,
+        delay: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run compiled ``sample_actions`` on the CUDA-graph thread.
+
+        ``torch.inference_mode`` is thread-local, so it must wrap the call
+        inside the infer worker, not on the gRPC handler thread.
+
+        Args:
+            batch: Policy input batch from ``_prepare_observation`` (tensors plus
+                the string-valued ``prompt`` / norm-head keys).
+            action_prefix: Prefix actions to condition the chunk on.
+            delay: Number of prefix steps already executed by the robot.
+
+        Returns:
+            The sampled action chunk, shape ``(1, n_action_steps, action_dim)``.
+        """
+
+        def _run():
+            with torch.inference_mode():
+                return self.policy.sample_actions(batch, action_prefix=action_prefix, delay=delay)
+
+        return self._infer_executor.submit(_run).result()
 
     def _load_policy(self):
         """Load the policy model from pretrained weights."""
@@ -341,14 +377,11 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         )
         delay = torch.tensor(0, dtype=torch.long, device=self.device)
 
-        with torch.inference_mode():
-            # One warmup call right after compiling
-            # two warmup calls are needed right after compiling
-            # the first warmup call is needed for compiling
-            # the second warmup call is needed for kernel autotuning
-            _ = self.policy.sample_actions(observation, action_prefix=action_prefix, delay=delay)
-            _ = self.policy.sample_actions(observation, action_prefix=action_prefix, delay=delay)
-            logger.info("Policy loaded successfully")
+        # Warmup on the same thread that will serve RPCs (see ``_infer_executor``).
+        # Two calls: the first compiles, the second autotunes kernels.
+        _ = self._sample_actions_sync(observation, action_prefix, delay)
+        _ = self._sample_actions_sync(observation, action_prefix, delay)
+        logger.info("Policy loaded successfully")
 
     def _decode_image(self, camera_image: robot_inference_pb2.CameraImage) -> torch.Tensor:
         """Decode an image from the protobuf message.
@@ -511,11 +544,13 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
             # atomic with respect to each other, or two concurrent requests interleave as
             # "A samples, B samples, A reads" and A's response carries B's uncertainty --
             # a wrong number silently attributed to the wrong observation, which is worse
-            # than no number at all. The lock is taken ONLY when accel is enabled, so the
-            # default serving path keeps its existing concurrency exactly.
+            # than no number at all. `_infer_executor` already serializes the sampling
+            # itself (one dedicated thread), but it cannot keep the sample and the
+            # `last_accel` read that follows it in one critical section -- that pairing is
+            # the lock's only remaining job, so it is taken ONLY when accel is enabled.
             accel_guard = self._accel_lock if self.accel_prefix else contextlib.nullcontext()
-            with accel_guard, torch.inference_mode():
-                action_chunk = self.policy.sample_actions(batch, action_prefix=action_prefix, delay=delay)
+            with accel_guard:
+                action_chunk = self._sample_actions_sync(batch, action_prefix, delay)
                 # action_chunk shape: (batch_size=1, n_action_steps, action_dim)
                 # Remove batch dimension and convert to numpy
                 action_chunk = action_chunk.squeeze(0).to("cpu", torch.float32).numpy()
@@ -544,7 +579,10 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
             # Unexpected error during inference
             traceback.print_exc()
             logger.exception("Error during inference")
-            context.abort(grpc.StatusCode.INTERNAL, f"Inference error: {e}")
+            # AssertionError() has an empty str(); include the type so the
+            # client sees a usable message.
+            detail = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+            context.abort(grpc.StatusCode.INTERNAL, f"Inference error: {detail}")
 
         response.inference_time_ms = (time.perf_counter() - start_time) * 1000
         return response
