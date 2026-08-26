@@ -135,6 +135,66 @@ Supporting changes, none of which alter a served score:
   (`OPENTAU_ACCEL_MEASURE_DTYPE_FLOOR=0`). It holds a second copy of the weights and is the
   first thing to fail on a shared GPU; skipping reports `NaN` rather than a fabricated ratio.
 
+### Added — `pi05_ttt`, π₀.₅ with Test-Time-Training memory — **new policy, opt-in, no `config_version` bump**
+
+A port of RoboTTT ([arXiv:2607.15275](https://arxiv.org/abs/2607.15275)) onto π₀.₅, registered
+as `policy.type=pi05_ttt`. A TTT layer is inserted after the attention block of each of the
+action expert's 18 layers: attention keeps operating strictly *within* a timestep, and the TTT
+layer's fast weights — a small per-head MLP updated by gradient descent at every timestep, in
+training and at inference alike — are the only path that crosses timesteps. The paper reports
+this buys 8K timesteps of context at constant inference cost, and with it stage tracking on
+long-horizon tasks, one-shot imitation from an in-context human video, and on-the-fly recovery.
+
+**Existing policies are untouched.** `PaliGemmaWithExpertModel.forward` / `_run_layer` gained
+one optional `ttt_state` parameter that defaults to `None`; pi05, pi05_mem and pi07_paligemma
+always pass `None`, which skips the branch entirely and leaves that forward bit-identical. The
+branch is decided by the policy class, identically on every rank, never by micro-batch content,
+so it does not need the OR-reduction CLAUDE.md rule 5 requires of content-dependent branches.
+`PI05Policy` gained an overridable `_build_flow_matching` seam so the subclass does not build a
+PaliGemma tower only to discard it.
+
+**A fresh `pi05_ttt` reproduces stock π₀.₅ at step 0.** Each TTT layer is blended in through a
+learned per-channel `tanh(alpha)` gate initialized to 0.001, so the randomly initialized memory
+cannot perturb a pretrained action expert before training decides how far to open it. The new
+state-dict keys (`...layers.N.ttt.*`, `...layers.N.ttt_gate.*`) are absorbed by the
+`strict=False` load path every `from_pretrained` override already uses, so an existing π₀.₅
+checkpoint warm-starts cleanly.
+
+**Also added:** 16 learned register tokens prepended to the expert's token stream each timestep
+(π₀.₅ carries robot state on the language side, inside the frozen VLM prefix, and the VL tokens
+bypass TTT for cost reasons — the registers are what carry vision and state into the memory);
+sequence action forcing, which samples the flow-matching noise level per timestep rather than
+per sequence; TBPTT with fast weights carried across segment boundaries and their gradients cut
+there; and per-timestep loss masking, so a timestep can act as pure context that updates the
+fast weights without contributing an imitation target.
+
+**Verified on real data.** `configs/dev/dev_config_pi05_ttt.json` warm-starts from
+`william-yue/pi05_base` and trains on `lerobot/droid_100`; 10 steps run end to end at ~1 s/step
+on one RTX 3090, peak 6.6 GiB. The warm-start is clean — every pretrained tensor present in that
+checkpoint loads, and the only keys the loader reports missing are the 343 new TTT parameters
+(stock π₀.₅ shows the identical 3-key gap for `da_head` / `discrete_action_embedding`, which that
+checkpoint simply does not carry). After 10 steps the frozen weights are bit-identical to the
+checkpoint at matched dtype, so `train_ttt_only` holds. The sequence path (TBPTT + loss masking)
+was exercised on real DROID trajectory windows.
+
+**Not yet usable for real long-context training.** The dataloader does not emit multi-timestep
+trajectory sequences, so `sequence_length` is 1 in both shipped configs: TTT runs and every TTT
+parameter receives gradients, but the fast weights take one update per sequence and cannot learn
+anything spanning timesteps. Gradients are truncated as specified; the *activation-memory*
+benefit of TBPTT additionally needs one backward per segment, which the shared training loop does
+not do. The frozen VLM prefix is recomputed per timestep rather than precomputed and cached.
+Best-of-N candidate sampling and ONNX export are refused outright, and the gRPC server skips
+compiling `sample_actions` and resets the policy per task, because the fast weights are
+per-rollout state. DAgger Distillation is a data-collection procedure; the loss masking it needs
+is here, the procedure is not.
+
+**The gate makes the TTT branch inert at init, not the whole policy.** At `alpha = 0` the TTT
+contribution is bit-identical to not running it. The register block is a separate, ungated change
+to the action expert's input: the tokens take softmax mass from the action tokens. The table is
+zero-initialized and the position ids are built so the action block keeps the RoPE phase it has
+without registers, which is as close as this gets — only `n_register_tokens=0` is bit-identical to
+stock π₀.₅.
+
 ## [0.13.0] - 2026-08-17
 
 ### Added

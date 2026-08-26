@@ -72,11 +72,10 @@ from opentau.planner.gemini_er_planner import GeminiERPlanner
 from opentau.policies.accel import configure_accel
 from opentau.policies.candidates import configure_candidates
 from opentau.policies.factory import get_policy_class
-from opentau.policies.utils import to_dtype_preserving_siglip_float32
+from opentau.policies.utils import maybe_compile_sample_actions, to_dtype_preserving_siglip_float32
 from opentau.scripts.grpc import auth, robot_inference_pb2, robot_inference_pb2_grpc
 from opentau.utils.random_utils import set_seed
 from opentau.utils.utils import (
-    attempt_torch_compile,
     auto_torch_device,
     init_logging,
 )
@@ -91,6 +90,12 @@ def _noop_request_hook(_method: str) -> None:
 
 
 class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
+    # Class-level default so the attribute always exists. `_load_policy` sets it
+    # per instance, but the gRPC tests construct the servicer with an injected
+    # mock policy and never call that, which made `_reset_policy_on_task_change`
+    # raise AttributeError inside the request path.
+    _policy_task: str | None = None
+
     """gRPC servicer implementing the RobotPolicyService.
 
     When ``cfg.planner.enabled`` is set, a high-level planner runs alongside
@@ -265,6 +270,31 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         with self._lock:
             return self._subtask
 
+    def _reset_policy_on_task_change(self, prompt: str) -> None:
+        """Reset the policy when the task changes.
+
+        Deliberately *not* folded into ``_update_shared_state``: that runs only
+        from ``_apply_planner``, which returns immediately when the planner is
+        disabled — and ``PlannerConfig.enabled`` defaults to False. An earlier
+        revision put the reset there, which left it unreachable for an operator
+        serving a bare VLA policy, i.e. the common case.
+
+        Without this, a policy carrying recurrent rollout state is reset exactly
+        once (in ``_load_policy``) and then carries one episode's fast weights
+        into every later episode and task — the failure the architecture exists
+        to prevent. It is also a no-op-shaped call for stateless policies, which
+        only clear an already-drained action queue.
+
+        Args:
+            prompt: The incoming request's task prompt.
+        """
+        with self._lock:
+            if prompt == self._policy_task:
+                return
+            self._policy_task = prompt
+        logger.info("Task changed to %r — resetting policy state", prompt)
+        self.policy.reset()
+
     def _apply_planner(self, request: robot_inference_pb2.ObservationRequest) -> None:
         """Rewrite ``request.prompt`` to the planner's current subtask.
 
@@ -339,8 +369,15 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         # a plain .to(bfloat16) would round them back. Serving is single-process, so this is safe.
         to_dtype_preserving_siglip_float32(self.policy, device=self.device, dtype=self.dtype)
         self.policy.eval()
-        self.policy.model.sample_actions = attempt_torch_compile(
-            self.policy.model.sample_actions, device_hint=self.device
+        # A policy carrying recurrent rollout state is not safe to compile here:
+        # its `sample_actions` mutates Python-level state (the carried fast
+        # weights, and an integer token position that feeds RoPE). Best case
+        # that recompiles once per distinct position and then falls back to
+        # eager permanently; worst case the position specializes into the graph
+        # and the phase silently freezes. `supports_torch_compile` only gates
+        # the training-side helper and never reaches this call site.
+        self.policy.model.sample_actions = maybe_compile_sample_actions(
+            self.policy, self.policy.model.sample_actions, device_hint=self.device
         )
 
         self.policy.reset()
@@ -537,6 +574,11 @@ class RobotPolicyServicer(robot_inference_pb2_grpc.RobotPolicyServiceServicer):
         response.timestamp_ns = time.time_ns()
 
         try:
+            # Reset per-episode policy state on a task change. Runs before the
+            # planner hook and independently of it, since the planner is
+            # disabled by default.
+            self._reset_policy_on_task_change(request.prompt)
+
             # Substitute the high-level planner's subtask for the prompt (no-op
             # when the planner is disabled).
             self._apply_planner(request)
