@@ -103,7 +103,14 @@ class TestWindowAnchoring:
         assert all(o <= 0.0 for o in offsets)
 
     def test_stride_one_uses_consecutive_frames(self):
-        """RoboTTT's own definition: one timestep is one control step."""
+        """The offset math places consecutive timesteps ``stride`` frames apart.
+
+        Exercised at stride 1 as pure offset arithmetic. Note stride 1 is no
+        longer a *reachable configuration* — RoboTTT's timestep is one action
+        chunk, so the config layer derives ``stride = action_chunk`` and rejects
+        anything else (see ``TestStrideEqualsChunkContract``); the mirror math
+        itself is stride-agnostic.
+        """
         freq = 20.0
         offsets = _obs_offsets(5, 1, freq)
         frames = [round(o * freq) for o in offsets]
@@ -112,8 +119,10 @@ class TestWindowAnchoring:
     def test_window_span_in_frames(self):
         """A T-timestep window spans ``(T-1)*stride + chunk`` frames.
 
-        This is what makes stride 1 tractable on short episodes: at chunk 10,
-        T=32 needs 41 frames, and LIBERO's shortest episode is 75.
+        With the derived ``stride = action_chunk``, the span is ``T * chunk``
+        frames — the budget that sizes ``sequence_length`` against a dataset's
+        shortest episodes (e.g. chunk 10: T=4 spans 40 frames vs LIBERO's
+        shortest episode of 75; the boundary-padding path absorbs the rest).
         """
         chunk = 10
         offsets = _action_offsets(32, 1, list(range(chunk)), 20.0)
@@ -224,6 +233,16 @@ class TestMirrorMatchesImplementation:
         assert "-(seq_len - 1 - t) * seq_stride / action_freq" in source, (
             "the observation-offset expression changed; update _obs_offsets to match"
         )
+        # The stride derivation is the behavior this contract rests on: `None`
+        # must resolve to `action_chunk` (chunk-tiled sequences), and the old
+        # stride-1 fallback must stay gone — reverting it re-opens the
+        # teacher-forcing leak while every validator-level test still passes.
+        assert "seq_stride = cfg.action_chunk if seq_len > 1 else 1" in source, (
+            "the stride derivation changed; sequence timesteps must tile in action chunks"
+        )
+        assert 'getattr(cfg.dataset_mixture, "sequence_stride", None) or 1' not in source, (
+            "the stride-1 fallback is back; that recipe leaks overlapping action targets"
+        )
 
 
 class TestNumpyRoundTrip:
@@ -301,3 +320,110 @@ class TestObsHistoryPadFallback:
         ds = self._stub(sequence_length=8)
         dropped = ds._obs_history_pad_fallback(padded=True)
         assert dropped.shape == (8,) and dropped.all()
+
+
+class TestStrideEqualsChunkContract:
+    """`sequence_stride` is derived from `action_chunk`, never a free knob.
+
+    RoboTTT's timestep is one H-step action chunk — its sequences tile the
+    trajectory in disjoint chunks and the paper has no stride concept. A
+    sub-chunk stride overlaps consecutive timesteps' action targets, so the
+    mostly teacher-forced context contains the current chunk's answers; the TTT
+    layers learn to copy them and closed-loop rollouts collapse (observed at
+    stride 1, chunk 20: 0% success from a 33%-success frozen base).
+    """
+
+    @staticmethod
+    def _cfg(sequence_length: int, sequence_stride: int | None, action_chunk: int = 20):
+        import draccus
+
+        from opentau.configs.train import TrainPipelineConfig
+
+        overrides = [
+            "--dataset_mixture.datasets",
+            '[{"repo_id": "dummy/dummy"}]',
+            "--dataset_mixture.sequence_length",
+            str(sequence_length),
+            "--action_chunk",
+            str(action_chunk),
+            "--batch_size",
+            "2",
+            "--dataloader_batch_size",
+            "2",
+        ]
+        if sequence_stride is not None:
+            overrides += ["--dataset_mixture.sequence_stride", str(sequence_stride)]
+        return draccus.parse(TrainPipelineConfig, args=overrides)
+
+    def test_mismatched_stride_is_rejected(self):
+        cfg = self._cfg(sequence_length=8, sequence_stride=1)
+        with pytest.raises(ValueError, match="disjoint action chunks"):
+            cfg._validate_sequence_stride()
+
+    def test_explicit_equal_stride_is_accepted(self):
+        cfg = self._cfg(sequence_length=8, sequence_stride=20)
+        cfg._validate_sequence_stride()
+
+    def test_none_is_accepted_and_derives_the_chunk(self):
+        cfg = self._cfg(sequence_length=8, sequence_stride=None)
+        cfg._validate_sequence_stride()
+
+    def test_stride_is_inert_at_sequence_length_one(self):
+        """Non-sequence configs keep any stride value: the field is never read."""
+        cfg = self._cfg(sequence_length=1, sequence_stride=3)
+        cfg._validate_sequence_stride()
+
+
+class TestOversamplingGuardStrideAware:
+    """The mixed-frequency guard trips only when timesteps land inside one frame.
+
+    Consecutive timesteps are ``seq_stride / action_freq`` seconds apart and
+    collide only when that is shorter than one source frame — i.e. when
+    ``action_freq > seq_stride * fps``. The stride-1-era predicate
+    (``action_freq > fps``) would wrongly reject valid oversampled configs now
+    that the stride derives from ``action_chunk``; the boundary cases below
+    fail under a revert.
+    """
+
+    @staticmethod
+    def _resolve(action_freq: float, fps: int, chunk: int = 2, stride: int | None = None):
+        from types import SimpleNamespace
+
+        from opentau.configs.default import DatasetConfig
+        from opentau.datasets.factory import resolve_delta_timestamps
+
+        train_cfg = SimpleNamespace(
+            dataset_mixture=SimpleNamespace(
+                action_freq=action_freq,
+                n_obs_history=None,
+                sequence_length=2,
+                sequence_stride=stride,
+            ),
+            action_chunk=chunk,
+            policy=None,
+        )
+        ds_cfg = DatasetConfig(
+            repo_id="_tests/oversampling",
+            data_features_name_mapping={"state": "observation.state", "actions": "action"},
+        )
+        meta = SimpleNamespace(
+            features={"observation.state": {}, "action": {}}, fps=fps, control_mode="joint"
+        )
+        return resolve_delta_timestamps(train_cfg, ds_cfg, meta)
+
+    def test_boundary_equal_passes(self):
+        """action_freq == stride * fps: timesteps exactly one frame apart — valid.
+
+        The stride-1-era predicate (``action_freq > fps``) raised here; passing
+        is the revert detector.
+        """
+        self._resolve(action_freq=20.0, fps=10)
+
+    def test_over_boundary_raises(self):
+        with pytest.raises(ValueError, match="resolve to the same"):
+            self._resolve(action_freq=21.0, fps=10)
+
+    def test_explicit_equal_stride_same_boundary(self):
+        self._resolve(action_freq=20.0, fps=10, stride=2)
+        with pytest.raises(ValueError, match="resolve to the same"):
+            self._resolve(action_freq=21.0, fps=10, stride=2)
