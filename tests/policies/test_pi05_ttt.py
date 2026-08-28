@@ -889,3 +889,114 @@ class TestForwardSequencePerSample:
             return_per_sample=True,
         )
         torch.testing.assert_close(with_ps["MSE"], without["MSE"], atol=0, rtol=0)
+
+
+class TestInferenceDiagnostics:
+    """The three inference-only knobs: validated, behavior-preserving by default."""
+
+    def test_adoption_choices_validated(self):
+        assert PI05TTTConfig(ttt_inference_update_adoption="last").ttt_inference_update_adoption == "last"
+        assert PI05TTTConfig(ttt_inference_update_adoption="first").ttt_inference_update_adoption == "first"
+        with pytest.raises(ValueError, match="'last' or 'first'"):
+            PI05TTTConfig(ttt_inference_update_adoption="middle")
+
+    def test_defaults_are_the_shipped_behavior(self):
+        config = PI05TTTConfig()
+        assert config.ttt_inference_update_adoption == "last"
+        assert config.ttt_inference_alpha_scale == pytest.approx(1.0)
+        assert config.ttt_inference_zero_registers is False
+
+    def test_alpha_scale_silences_memory_in_eval_mode_only(self):
+        from opentau.policies.ttt_layer import TanhGate
+
+        gate = TanhGate(width=4, init_value=0.5)
+        attn = torch.randn(2, 3, 4)
+        ttt = torch.randn(2, 3, 4)
+
+        gate.eval()
+        gate.inference_alpha_scale = 0.0
+        torch.testing.assert_close(gate(attn, ttt), attn)  # memory contribution silenced
+
+        gate.train()  # training mode ignores the diagnostic scale entirely
+        torch.testing.assert_close(gate(attn, ttt), attn + torch.tanh(gate.alpha) * ttt)
+
+        gate.eval()
+        gate.inference_alpha_scale = 1.0  # default scale is a no-op in eval too
+        torch.testing.assert_close(gate(attn, ttt), attn + torch.tanh(gate.alpha) * ttt)
+
+    def test_zero_registers_feeds_the_step_zero_table_in_eval_mode_only(self):
+        """Drives the real selection method on a stub, without the 3.4B model."""
+        from opentau.policies.pi05_ttt.modeling_pi05_ttt import PI05TTTFlowMatching
+
+        stub = object.__new__(PI05TTTFlowMatching)
+        stub.config = PI05TTTConfig(n_register_tokens=4, sequence_length=1, tbptt_segment_length=1)
+        stub.register_tokens = torch.full((4, stub.config.proj_width), 0.7)
+
+        stub.training = False
+        stub.config.ttt_inference_zero_registers = True
+        assert torch.all(stub._register_table_for_forward() == 0)
+
+        stub.config.ttt_inference_zero_registers = False
+        assert torch.all(stub._register_table_for_forward() == 0.7)
+
+        stub.training = True  # training mode always uses the trained table
+        stub.config.ttt_inference_zero_registers = True
+        assert torch.all(stub._register_table_for_forward() == 0.7)
+
+    def test_first_step_capture_fires_once_and_adoption_resets(self):
+        """Capture-once / adopt / between-calls-reset, on a stub (no 3.4B model)."""
+        from types import SimpleNamespace
+
+        from opentau.policies.pi05_ttt.modeling_pi05_ttt import PI05TTTFlowMatching
+
+        stub = object.__new__(PI05TTTFlowMatching)
+        stub.config = PI05TTTConfig(
+            n_register_tokens=4,
+            sequence_length=1,
+            tbptt_segment_length=1,
+            ttt_inference_update_adoption="first",
+        )
+        first, later = torch.tensor([1.0]), torch.tensor([2.0])
+        stub._first_step_adoption = None
+        stub._active_ttt_state = SimpleNamespace(outgoing={0: first})
+        stub._maybe_capture_first_step_update()
+        stub._active_ttt_state.outgoing = {0: later}
+        stub._maybe_capture_first_step_update()  # must NOT overwrite the first capture
+        assert torch.equal(stub._first_step_adoption[0], first)
+
+        stub._carried_fast_weights = {}
+        stub._inference_token_position = 0
+        stub._adopt_fast_weights(SimpleNamespace(outgoing={0: later}))
+        assert torch.equal(stub._carried_fast_weights[0], first)  # "first" wins over outgoing
+        assert stub._inference_token_position == stub.config.n_expert_tokens_per_timestep
+        assert stub._first_step_adoption is None  # reset between calls
+
+        # "last" adoption ignores a stale capture and takes outgoing.
+        stub.config.ttt_inference_update_adoption = "last"
+        stub._first_step_adoption = {0: first}
+        stub._adopt_fast_weights(SimpleNamespace(outgoing={0: later}))
+        assert torch.equal(stub._carried_fast_weights[0], later)
+        assert stub._first_step_adoption is None
+
+    def test_attach_wires_the_alpha_scale_from_config(self):
+        """Dropping the config->gate wiring must fail a test, not silently no-op the knob."""
+        from types import SimpleNamespace
+
+        from opentau.policies.pi05_ttt.modeling_pi05_ttt import PI05TTTFlowMatching
+
+        stub = object.__new__(PI05TTTFlowMatching)
+        stub.config = PI05TTTConfig(
+            n_register_tokens=2,
+            sequence_length=1,
+            tbptt_segment_length=1,
+            ttt_num_heads=2,
+            ttt_inference_alpha_scale=0.25,
+        )
+        layers = [SimpleNamespace(), SimpleNamespace()]
+        stub.paligemma_with_expert = SimpleNamespace(
+            gemma_expert=SimpleNamespace(model=SimpleNamespace(layers=layers)),
+            config=SimpleNamespace(gemma_expert_config=SimpleNamespace(hidden_size=8)),
+        )
+        stub._attach_ttt_layers()
+        for layer in layers:
+            assert layer.ttt_gate.inference_alpha_scale == pytest.approx(0.25)

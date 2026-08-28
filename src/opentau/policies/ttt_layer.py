@@ -665,6 +665,11 @@ class TanhGate(nn.Module):
     def __init__(self, width: int, init_value: float = 0.001):
         super().__init__()
         self.alpha = nn.Parameter(torch.full((width,), init_value))
+        # Diagnostic multiplier on the gate, applied only when the module is in
+        # eval mode — which includes in-training validation, so leave it at 1.0
+        # in training configs. 0.0 silences the memory contribution entirely so
+        # an existing checkpoint can be evaluated with the TTT pathway off.
+        self.inference_alpha_scale: float = 1.0
 
     def forward(self, attention_output: Tensor, ttt_output: Tensor) -> Tensor:
         """Adds the gated TTT contribution to the attention output.
@@ -677,6 +682,8 @@ class TanhGate(nn.Module):
             The blended output, same shape and dtype as ``attention_output``.
         """
         gate = torch.tanh(self.alpha).to(ttt_output.dtype)
+        if not self.training and self.inference_alpha_scale != 1.0:
+            gate = gate * self.inference_alpha_scale
         return attention_output + gate * ttt_output
 
 

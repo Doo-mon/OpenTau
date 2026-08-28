@@ -206,6 +206,9 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         # the next call's RoPE should start from. Both are rollout state, reset
         # by ``PI05TTTPolicy.reset``.
         self._carried_fast_weights: dict[int, TTTFastWeights] = {}
+        # First-Euler-step fast-weight capture for
+        # `config.ttt_inference_update_adoption == "first"`; None outside a call.
+        self._first_step_adoption: dict[int, TTTFastWeights] | None = None
         self._inference_token_position: int = 0
         # Set for the duration of a ``sample_actions`` call so the overridden
         # ``denoise_step`` can reach it without changing the parent's signature.
@@ -243,6 +246,7 @@ class PI05TTTFlowMatching(PI05FlowMatching):
                 expected_mini_batch_size=self.config.n_expert_tokens_per_timestep,
             )
             layer.ttt_gate = TanhGate(width, init_value=self.config.ttt_gate_init)
+            layer.ttt_gate.inference_alpha_scale = self.config.ttt_inference_alpha_scale
 
     def ttt_parameters(self) -> list[nn.Parameter]:
         """Returns every parameter this policy adds on top of stock π₀.₅.
@@ -307,6 +311,22 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         time_beta = beta_dist.sample((batch_size, num_timesteps)).to(device=device, dtype=torch.float32)
         return time_beta * 0.999 + 0.001
 
+    def _register_table_for_forward(self) -> Tensor:
+        """Selects the register table the forward embeds.
+
+        Returns the trained table, except under the
+        ``ttt_inference_zero_registers`` diagnostic in inference mode, where the
+        step-0 (zero) table is substituted so the trained registers' ungated
+        perturbation of the frozen expert can be isolated from the gated memory
+        contribution. Training mode always uses the trained table.
+
+        Returns:
+            The ``(n_register_tokens, proj_width)`` table to embed.
+        """
+        if self.config.ttt_inference_zero_registers and not self.training:
+            return torch.zeros_like(self.register_tokens)
+        return self.register_tokens
+
     def embed_suffix(
         self,
         noisy_actions: Tensor,
@@ -353,7 +373,9 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         # The parent embeds `timestep` for AdaRMS but derives the token
         # embeddings only from `noisy_actions`, so `embs` covers the action
         # block while `adarms_cond` already covers registers + actions.
-        register_emb = repeat(self.register_tokens.to(embs.dtype), "r w -> b r w", b=embs.shape[0])
+        register_emb = repeat(
+            self._register_table_for_forward().to(embs.dtype), "r w -> b r w", b=embs.shape[0]
+        )
         embs = torch.cat([register_emb, embs], dim=1)
 
         pad_masks = torch.cat(
@@ -1014,11 +1036,13 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         the expert pass receives ``self._active_ttt_state``.
 
         The fast weights are *read* on every step of the Euler loop but the
-        rollout only *adopts* the update produced by the final step — see
-        :meth:`sample_actions`. One policy call must perform exactly one
-        fast-weight update ("one mini batch per inference"), not one per
-        denoising step, or memory would advance ``config.num_steps`` times
-        faster at inference than it ever did in training.
+        rollout *adopts* exactly one step's update — which step is
+        ``config.ttt_inference_update_adoption`` ("last", the default, or
+        "first"; see :meth:`sample_actions` and :meth:`_maybe_capture_first_step_update`).
+        One policy call must perform exactly one fast-weight update ("one mini
+        batch per inference"), not one per denoising step, or memory would
+        advance ``config.num_steps`` times faster at inference than it ever did
+        in training.
 
         **Known train/inference mismatch in the update's input distribution.**
         The update *count* is right, but the flow-matching time it is computed at
@@ -1030,15 +1054,15 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         on ``x_t``, the fast weights ingest a systematically different input at
         deployment than they were trained on.
 
-        The final step is adopted deliberately — it is the update driven by the
-        chunk the robot actually executes, which is the quantity the memory
-        should carry forward — but the mismatch is real and unmeasured. The
-        alternatives are to adopt the *first* step's update (noisy, closer to the
-        training marginal, but derived from a chunk that was discarded) or to add
-        a dedicated write pass at a training-matched ``tau`` (correct, one extra
-        expert forward per call). Deferred until there is a long-context training
-        run to measure it against, because picking between them on reasoning
-        alone is how a plausible-but-wrong default gets locked in.
+        The last-step default is the update driven by the chunk the robot
+        actually executes; the first-step alternative ingests the pure-noise
+        tokens matching the mode of the training marginal. The mismatch is now
+        *measurable* via the config knob, and on the one checkpoint measured so
+        far the two adoptions evaluated statistically identically (a degraded
+        frozen-base checkpoint; both within noise of each other), so neither is
+        established as superior — the default stays "last". A dedicated write
+        pass at a training-matched ``tau`` (one extra expert forward per call)
+        remains a possible third design if a future measurement separates them.
 
         Args:
             prefix_pad_masks: Prefix padding masks.
@@ -1071,8 +1095,50 @@ class PI05TTTFlowMatching(PI05FlowMatching):
             adarms_cond=[None, adarms_cond],
             ttt_state=self._active_ttt_state,
         )
+        self._maybe_capture_first_step_update()
         suffix_out = outputs_embeds[1][:, -self.config.chunk_size :]
         return self.action_out_proj(suffix_out).to(dtype=torch.float32)
+
+    def _maybe_capture_first_step_update(self) -> None:
+        """Captures the first Euler step's fast-weight update, once per call.
+
+        Under ``ttt_inference_update_adoption == "first"`` the first denoising
+        step runs at ``tau = 1`` — pure-noise action tokens, the mode of the
+        training marginal — and its update must be stashed before later
+        (nearly-clean) steps overwrite ``outgoing``. The ``is None`` guard makes
+        the capture fire exactly once per policy call; :meth:`sample_actions`
+        resets the slot at the start of every call.
+        """
+        if (
+            self.config.ttt_inference_update_adoption == "first"
+            and self._active_ttt_state is not None
+            and self._first_step_adoption is None
+            and self._active_ttt_state.outgoing
+        ):
+            self._first_step_adoption = {
+                idx: fw.detach() for idx, fw in self._active_ttt_state.outgoing.items()
+            }
+
+    def _adopt_fast_weights(self, ttt_state: "TTTSequenceState") -> None:
+        """Adopts one step's fast-weight update after a policy call.
+
+        "first" adopts the captured first-Euler-step update (falling back to
+        ``outgoing`` if no capture happened); "last" adopts ``outgoing``, the
+        final step's update. Either way the capture slot is cleared so the next
+        call starts fresh, and the token position advances only when something
+        was adopted.
+
+        Args:
+            ttt_state: The per-call sequence state whose ``outgoing`` holds the
+                final Euler step's update.
+        """
+        if self.config.ttt_inference_update_adoption == "first" and self._first_step_adoption:
+            self._carried_fast_weights = self._first_step_adoption
+            self._inference_token_position += self.config.n_expert_tokens_per_timestep
+        elif ttt_state.outgoing:
+            self._carried_fast_weights = {idx: fw.detach() for idx, fw in ttt_state.outgoing.items()}
+            self._inference_token_position += self.config.n_expert_tokens_per_timestep
+        self._first_step_adoption = None
 
     def sample_actions(
         self,
@@ -1157,6 +1223,9 @@ class PI05TTTFlowMatching(PI05FlowMatching):
             incoming=self._carried_fast_weights,
         )
         self._active_ttt_state = ttt_state
+        # Clear any capture a mid-call exception may have stranded, so this
+        # call's first Euler step is the one captured.
+        self._first_step_adoption = None
         try:
             actions = super().sample_actions(
                 images,
@@ -1173,11 +1242,9 @@ class PI05TTTFlowMatching(PI05FlowMatching):
         finally:
             self._active_ttt_state = None
 
-        # Adopt only the final Euler step's update, and detach: a rollout is not
-        # a training graph, and keeping one would grow without bound.
-        if ttt_state.outgoing:
-            self._carried_fast_weights = {idx: fw.detach() for idx, fw in ttt_state.outgoing.items()}
-            self._inference_token_position += self.config.n_expert_tokens_per_timestep
+        # Adopt exactly one step's update per policy call, and detach: a rollout
+        # is not a training graph, and keeping one would grow without bound.
+        self._adopt_fast_weights(ttt_state)
         return actions
 
 
