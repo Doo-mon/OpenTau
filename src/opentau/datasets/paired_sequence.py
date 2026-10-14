@@ -57,6 +57,30 @@ from torch.utils.data import Dataset
 
 from opentau.datasets.lerobot_dataset import LeRobotDataset
 
+#: Seed multiplier for the pair draw (which episodes a sample pairs).
+_PAIR_SEED_MULTIPLIER = 1_000_003
+#: Seed multiplier for the zero-shot mode draw (whether a sample is blanked).
+_MODE_SEED_MULTIPLIER = 7_919_003
+
+#: Added to the zero-shot mode seed so it can never coincide with the pair-draw
+#: seed. The two otherwise differ only by their multiplier, which collapses at
+#: ``seed == 0`` -- the default, since the factory passes ``cfg.seed or 0``.
+#:
+#: Two constraints pin the value:
+#:
+#: * It must be **below 2**:sup:`32`. Torch's CPU generator consumes only the low
+#:   32 bits of a seed, so a larger offset is silently discarded and the fix
+#:   becomes a no-op (``manual_seed(i)`` and ``manual_seed(i + 2**40)`` yield the
+#:   identical stream).
+#: * It must be **odd**, and the multipliers' difference must stay even. A
+#:   collision needs ``seed * difference + offset = 0 (mod 2**32)``; the current
+#:   difference (``_MODE_SEED_MULTIPLIER - _PAIR_SEED_MULTIPLIER``) is even, which
+#:   makes the first term even for every seed, so an odd offset is unsatisfiable
+#:   for ALL seeds rather than just the default one. Changing either multiplier to
+#:   one whose difference is odd would void the argument -- the tests derive the
+#:   difference from the constants above so that cannot pass unnoticed.
+_MODE_SEED_OFFSET = 0x9E3779B9
+
 
 class PairedSequenceDataset(Dataset):
     """Draws two episodes of one pairing key and returns them as one sequence.
@@ -79,10 +103,22 @@ class PairedSequenceDataset(Dataset):
             which keeps distributed runs and resumes reproducible.
         forbid_same_scene: Reject a draw whose two episodes share a scene id, so
             the pair cannot be solved by copying A's motion frame-for-frame.
+        n_demos: Demonstrations placed in context before the supervised rollout.
+            The policy sees ``(n_demos + 1) * sequence_length`` timesteps.
+        zero_shot_prob: Fraction of samples whose demonstration half is blanked --
+            frames zeroed and ``timestep_is_pad`` set across it -- so one run
+            trains both demo-present and demo-absent behaviour. ``0.0`` (the
+            default) is inert. A blanked sample keeps the rollout's own prompt
+            rather than the key's ambiguous one, which would otherwise leave it
+            with neither a demonstration nor a task identity.
 
     Raises:
-        ValueError: If a key has fewer than two episodes, or ``prompts`` is
-            missing a key.
+        ValueError: If a key has fewer than ``n_demos + 1`` episodes (one per
+            demonstration plus the rollout), ``prompts`` is missing a key,
+            ``n_demos`` is below 1, ``zero_shot_prob`` falls outside
+            ``[0, 1]``, or ``zero_shot_prob`` is positive while the base dataset
+            emits no ``timestep_is_pad`` (which only sequence mode produces, and
+            without which the TTT inner loop would train on the blank frames).
     """
 
     #: Keys carrying no timestep axis; taken from B, the supervised half.
@@ -139,6 +175,7 @@ class PairedSequenceDataset(Dataset):
         seed: int = 0,
         forbid_same_scene: bool = True,
         n_demos: int = 1,
+        zero_shot_prob: float = 0.0,
     ) -> None:
         # Set before anything else: `__getattr__` forwards unknown attributes to
         # the wrapped dataset, so a miss here would delegate rather than raise.
@@ -146,6 +183,9 @@ class PairedSequenceDataset(Dataset):
         if n_demos < 1:
             raise ValueError(f"n_demos must be >= 1, got {n_demos}")
         self.n_demos = n_demos
+        if not 0.0 <= zero_shot_prob <= 1.0:
+            raise ValueError(f"zero_shot_prob must be in [0, 1], got {zero_shot_prob}")
+        self.zero_shot_prob = zero_shot_prob
         need = n_demos + 1
         thin = {k: len(v) for k, v in pairing_keys.items() if len(v) < need}
         if thin:
@@ -168,6 +208,21 @@ class PairedSequenceDataset(Dataset):
         # window at its last timestep, so anchoring here makes each half cover
         # its episode end-to-end rather than an arbitrary interior slice.
         self._last_row = self._build_last_row_index()
+
+        # Blanking needs `timestep_is_pad`, which only sequence mode emits. Probe
+        # one sample now: otherwise the first BLANKED sample raises, which at
+        # 0 < p < 1 means a few steps into the run, inside a dataloader worker,
+        # where the traceback is far from the misconfiguration that caused it.
+        if self.zero_shot_prob > 0.0:
+            first = self.base[self._last_row[self.pairing_keys[self.keys[0]][0]]]
+            if not isinstance(first.get("timestep_is_pad"), torch.Tensor):
+                raise ValueError(
+                    "zero_shot_prob > 0 needs `timestep_is_pad` on each demonstration so the "
+                    "TTT inner update is skipped across the blanked half (#558), but the base "
+                    "dataset emitted none. It is only produced in sequence mode -- set the "
+                    "policy's `sequence_length` (and keep `pair_episodes` on), or leave "
+                    "zero_shot_prob at 0."
+                )
 
         # A scene filter that can never be satisfied is worse than none: every
         # draw falls through to the fallback. Say so, loudly, at construction.
@@ -268,7 +323,7 @@ class PairedSequenceDataset(Dataset):
         Returns:
             ``(key, [demo episodes], rollout episode)``.
         """
-        g = torch.Generator().manual_seed(self.seed * 1_000_003 + index)
+        g = torch.Generator().manual_seed(self.seed * _PAIR_SEED_MULTIPLIER + index)
         key = self.keys[int(torch.randint(len(self.keys), (1,), generator=g))]
         eps = self.pairing_keys[key]
 
@@ -324,6 +379,72 @@ class PairedSequenceDataset(Dataset):
                 return info[field]
         return episode
 
+    def _is_zero_shot(self, index: int) -> bool:
+        """Whether this sample's demonstration half is blanked.
+
+        Drawn off a stream SEPARATE from ``_draw``'s so that turning
+        ``zero_shot_prob`` on does not consume randomness from the pair draw --
+        a 1-shot run's episode choices stay bit-identical to runs made before
+        this existed. Like the pair draw it is a pure function of
+        ``(seed, index)``, so a given index is the same mode on every rank and
+        every epoch, which keeps distributed runs and resumes reproducible.
+
+        The ``_MODE_SEED_OFFSET`` is load-bearing, not decoration. Without it the
+        two seeds are ``seed * _MODE_SEED_MULTIPLIER + index`` and
+        ``seed * _PAIR_SEED_MULTIPLIER + index``, which COINCIDE at ``seed == 0``
+        regardless of the multipliers' values -- and the factory passes
+        ``cfg.seed or 0``, so that is the default config. The pair draw would
+        still be bit-identical (the generators are separate objects), but the
+        mode would be derived from the same engine state as the episode choice,
+        correlating which episodes get paired with whether the sample is
+        blanked. The offset cannot collide for any ``seed >= 0``.
+
+        Args:
+            index: Sample index.
+
+        Returns:
+            True if the demonstration half should be blanked.
+        """
+        if self.zero_shot_prob <= 0.0:
+            return False
+        if self.zero_shot_prob >= 1.0:
+            return True
+        g = torch.Generator().manual_seed(self.seed * _MODE_SEED_MULTIPLIER + index + _MODE_SEED_OFFSET)
+        return bool(torch.rand((1,), generator=g).item() < self.zero_shot_prob)
+
+    def _blank_demos(self, demos: list[dict[str, Any]]) -> None:
+        """Erases the demonstration halves in place, making the sample 0-shot.
+
+        Two things must both happen. The camera frames are zeroed so the half
+        carries no image content, and ``timestep_is_pad`` is set across it so
+        ``TTTMLPLayer.forward`` zeroes the inner-loop ``eta`` there (#558) and no
+        fast weights are updated from the blanked frames. ``loss_mask`` is
+        already False across every demonstration, so it needs no change.
+
+        Args:
+            demos: The demonstration samples, modified in place.
+
+        Raises:
+            ValueError: If a demonstration carries no ``timestep_is_pad``. Without
+                it the TTT inner loop would train its fast weights on the blank
+                frames -- silently worse than either mode -- so this refuses
+                rather than degrading quietly.
+        """
+        for d in demos:
+            for k, v in d.items():
+                if k.startswith("camera") and isinstance(v, torch.Tensor):
+                    d[k] = torch.zeros_like(v)
+            tp = d.get("timestep_is_pad")
+            if not isinstance(tp, torch.Tensor):
+                raise ValueError(
+                    "zero_shot_prob > 0 needs `timestep_is_pad` on each demonstration so the "
+                    "TTT inner update is skipped across the blanked half (#558), but the base "
+                    "dataset emitted none. It is only produced in sequence mode -- set the "
+                    "policy's `sequence_length` (and keep `pair_episodes` on), or leave "
+                    "zero_shot_prob at 0."
+                )
+            d["timestep_is_pad"] = torch.ones_like(tp)
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         """Builds one demonstration+rollout sample.
 
@@ -344,6 +465,10 @@ class PairedSequenceDataset(Dataset):
         key, ep_demos, ep_b = self._draw(index)
         demos = [self.base[self._last_row[e]] for e in ep_demos]
         b = self.base[self._last_row[ep_b]]
+
+        blanked = self._is_zero_shot(index)
+        if blanked:
+            self._blank_demos(demos)
 
         t_b = self._timesteps(b)
         t_demos = [self._timesteps(d) for d in demos]
@@ -400,7 +525,14 @@ class PairedSequenceDataset(Dataset):
         # the demonstration supplies the unfamiliar object's handling. Keeping
         # B's own prompt is then correct; blanking it would erase the task
         # identity the model needs.
-        if self.prompts[key] is not None:
+        #
+        # A BLANKED sample is the one case where the override must not apply. The
+        # ambiguous prompt exists because the demonstration carries the answer --
+        # with the demonstration erased, overwriting the prompt too would leave the
+        # sample with neither, and the target becomes unlearnable (the model can
+        # only guess which variant it is). A 0-shot sample keeps the rollout's own
+        # instruction, which is its only remaining information channel.
+        if self.prompts[key] is not None and not blanked:
             out["prompt"] = self.prompts[key]
         out["pairing_key"] = key
         return out

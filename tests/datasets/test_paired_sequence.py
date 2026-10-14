@@ -48,9 +48,10 @@ class _StubBase:
             mismatch guard.
     """
 
-    def __init__(self, episodes, scenes=None, ragged=None):
+    def __init__(self, episodes, scenes=None, ragged=None, timestep_pad=False):
         self._episodes = list(episodes)
         self._ragged = ragged
+        self._timestep_pad = timestep_pad
         rows = {e: i for i, e in enumerate(self._episodes)}
         self.epi2idx = rows
         self.episode_data_index = {
@@ -65,7 +66,7 @@ class _StubBase:
     def __getitem__(self, row):
         e = self._by_row[row]
         n = T - 1 if e == self._ragged else T
-        return {
+        item = {
             "state": torch.full((n, 3), float(e)),
             "camera0": torch.full((n, 3, 2, 2), float(e)),
             "loss_mask": torch.ones(n, dtype=torch.bool),
@@ -73,13 +74,16 @@ class _StubBase:
             "episode_index": torch.tensor(e),
             "dataset_index": torch.tensor(0),
         }
+        if self._timestep_pad:
+            item["timestep_is_pad"] = torch.zeros(n, dtype=torch.bool)
+        return item
 
     def __len__(self):
         return len(self._episodes)
 
 
-def _make(episodes=EPISODES, scenes=None, ragged=None, **kw):
-    base = _StubBase(episodes, scenes, ragged)
+def _make(episodes=EPISODES, scenes=None, ragged=None, timestep_pad=False, **kw):
+    base = _StubBase(episodes, scenes, ragged, timestep_pad)
     return PairedSequenceDataset(
         base=base,
         pairing_keys={"OpenDrawer__left": list(episodes)},
@@ -592,3 +596,180 @@ class TestPairingIsActuallyWired:
         sentinel = SimpleNamespace(episodes=[1, 2])
         cfg = SimpleNamespace(dataset_mixture=SimpleNamespace(pair_episodes=False), seed=0)
         assert _maybe_pair(sentinel, SimpleNamespace(), cfg) is sentinel
+
+
+class TestZeroShotProb:
+    """`zero_shot_prob` blanks a fraction of demonstrations so one run trains both modes."""
+
+    def test_default_is_inert(self):
+        """At the default 0.0 nothing is blanked, so existing runs are unaffected."""
+        d = _make(timestep_pad=True)
+        assert d.zero_shot_prob == 0.0
+        assert not any(d._is_zero_shot(i) for i in range(500))
+
+    def test_pair_draw_is_unperturbed_by_the_mode_draw(self):
+        """The mode is drawn off a separate RNG stream, so pair draws are unchanged.
+
+        This is what keeps runs made before this feature reproducible: enabling it
+        must not shift which episodes a given index pairs.
+        """
+        off = _make(timestep_pad=True, zero_shot_prob=0.0)
+        on = _make(timestep_pad=True, zero_shot_prob=0.5)
+        assert [off._draw(i) for i in range(200)] == [on._draw(i) for i in range(200)]
+
+    def test_rate_tracks_the_configured_probability(self):
+        d = _make(timestep_pad=True, zero_shot_prob=0.5)
+        hits = sum(d._is_zero_shot(i) for i in range(4000))
+        assert 0.45 < hits / 4000 < 0.55
+
+    def test_mode_is_deterministic_per_index(self):
+        """Same index, same mode -- so ranks agree and a resume reproduces the run."""
+        a = _make(timestep_pad=True, zero_shot_prob=0.5)
+        b = _make(timestep_pad=True, zero_shot_prob=0.5)
+        assert [a._is_zero_shot(i) for i in range(300)] == [b._is_zero_shot(i) for i in range(300)]
+
+    def test_blanked_sample_zeroes_demo_half_and_marks_it_padded(self):
+        """The demonstration half is erased AND padded; the rollout half survives."""
+        d = _make(timestep_pad=True, zero_shot_prob=1.0)
+        s = d[0]
+        cam, tp, lm = s["camera0"], s["timestep_is_pad"], s["loss_mask"]
+        assert torch.all(cam[:T] == 0), "demonstration frames were not blanked"
+        assert not torch.all(cam[T:] == 0), "the rollout half must keep its content"
+        assert torch.all(tp[:T]), "demo half must be marked padded so the TTT inner update skips it"
+        assert not torch.any(lm[:T]), "loss_mask across the demonstration must stay False"
+
+    def test_kept_sample_retains_a_real_demonstration(self):
+        """A non-blanked sample is untouched -- otherwise 1-shot training is destroyed."""
+        d = _make(timestep_pad=True, zero_shot_prob=0.0)
+        s = d[0]
+        assert not torch.all(s["camera0"][:T] == 0)
+        assert not torch.any(s["timestep_is_pad"][:T])
+
+    def test_rejects_an_out_of_range_probability(self):
+        with pytest.raises(ValueError, match="zero_shot_prob"):
+            _make(timestep_pad=True, zero_shot_prob=1.5)
+
+    def test_refuses_to_blank_without_timestep_is_pad(self):
+        """Without the pad flag the TTT inner loop would train on the blank frames.
+
+        That is worse than either mode, so the loader refuses rather than degrading
+        quietly -- and refuses at CONSTRUCTION, not on the first blanked sample,
+        which at 0 < p < 1 would surface inside a dataloader worker mid-run.
+        """
+        with pytest.raises(ValueError, match="timestep_is_pad"):
+            _make(timestep_pad=False, zero_shot_prob=1.0)
+
+    def test_mode_seed_cannot_collide_with_the_pair_seed_at_seed_zero(self):
+        """The mode stream must not be the ``seed * k + index`` stream at seed 0.
+
+        The factory passes ``cfg.seed or 0``, so ``seed == 0`` is the default, and
+        there every ``seed * multiplier + index`` collapses to plain ``index`` --
+        the mode would then come off the same engine state as the episode choice,
+        correlating which episodes a sample pairs with whether it is blanked.
+
+        Pinned against the actual draw rather than the formula: re-deriving the
+        arithmetic from copied multipliers would compare constants to themselves
+        and still pass if the offset were dropped (CLAUDE.md rule 8). The marginal
+        rate would not catch it either -- a collision changes correlation, not the
+        fraction blanked.
+        """
+        d = _make(timestep_pad=True, zero_shot_prob=0.5, seed=0)
+
+        # What `_is_zero_shot` WOULD produce if its seed collapsed to bare `index`,
+        # i.e. the pre-offset implementation this guards against.
+        collided = [
+            bool(torch.rand((1,), generator=torch.Generator().manual_seed(i)).item() < 0.5)
+            for i in range(256)
+        ]
+        actual = [d._is_zero_shot(i) for i in range(256)]
+        assert actual != collided, "mode stream collapsed onto the pair-draw seed at seed 0"
+
+    def test_mode_seed_offset_survives_torchs_32_bit_seed_truncation(self):
+        """The offset must be < 2**32, or torch discards it and the fix is a no-op.
+
+        Torch's CPU generator consumes only the low 32 bits of a seed, so e.g.
+        ``manual_seed(i)`` and ``manual_seed(i + 2**40)`` yield the identical
+        stream. Pinned on the generator itself rather than on the constant, so a
+        revert to a too-large offset fails here.
+        """
+        from opentau.datasets.paired_sequence import _MODE_SEED_OFFSET
+
+        def first(seed):
+            return torch.rand((1,), generator=torch.Generator().manual_seed(seed)).item()
+
+        assert first(7) != first(7 + _MODE_SEED_OFFSET), "offset discarded by seed truncation"
+
+    def test_mode_seed_cannot_collide_for_any_seed(self):
+        """Odd offset vs an even multiplier difference -- unsatisfiable.
+
+        A collision needs ``seed * difference + offset = 0 (mod 2**32)``. With the
+        difference even, that first term is even for every seed, so an odd offset
+        admits no solution. The difference is derived from the source constants
+        rather than copied, so changing a multiplier to one whose difference is odd
+        fails here instead of passing against stale prose.
+        """
+        from opentau.datasets.paired_sequence import (
+            _MODE_SEED_MULTIPLIER,
+            _MODE_SEED_OFFSET,
+            _PAIR_SEED_MULTIPLIER,
+        )
+
+        # Derived from the source constants, not a copy of their difference, so
+        # changing either multiplier to one whose difference is odd fails here
+        # rather than passing against a stale number.
+        difference = _MODE_SEED_MULTIPLIER - _PAIR_SEED_MULTIPLIER
+        assert _MODE_SEED_OFFSET % 2 == 1, "an even offset admits a colliding seed"
+        assert difference % 2 == 0, "an odd multiplier difference voids the oddness argument"
+        assert not [s for s in range(20000) if (s * difference + _MODE_SEED_OFFSET) % 2**32 == 0]
+
+
+class TestZeroShotProbIsActuallyWired:
+    """``zero_shot_prob`` must reach the dataset, not just exist on the config.
+
+    Every ``TestZeroShotProb`` case builds ``PairedSequenceDataset`` directly, so
+    dropping the kwarg in the factory would leave a configured value silently
+    inert -- the fail-open class ``TestPairingIsActuallyWired`` exists to catch.
+    """
+
+    def test_factory_passes_zero_shot_prob_through(self, monkeypatch):
+        from opentau.configs.default import DatasetConfig, DatasetMixtureConfig
+        from opentau.datasets import factory as ds_factory
+
+        seen = {}
+
+        class _Spy(PairedSequenceDataset):
+            def __init__(self, *a, **kw):
+                seen.update(kw)
+                super().__init__(*a, **kw)
+
+        monkeypatch.setattr("opentau.datasets.paired_sequence.PairedSequenceDataset", _Spy)
+
+        base = _StubBase(EPISODES, timestep_pad=True)
+        dataset_cfg = DatasetConfig(
+            repo_id="mock", root="/tmp/mock", episodes=list(EPISODES), ambiguous_prompt="Open the drawer."
+        )
+        cfg = SimpleNamespace(
+            dataset_mixture=DatasetMixtureConfig(
+                datasets=[dataset_cfg], weights=[1.0], pair_episodes=True, n_demos=1, zero_shot_prob=0.25
+            ),
+            seed=7,
+        )
+        ds_factory._maybe_pair(base, dataset_cfg, cfg)
+        assert seen.get("zero_shot_prob") == 0.25, "the factory dropped zero_shot_prob"
+
+
+class TestZeroShotPromptStaysInformative:
+    """A blanked sample keeps a task-identifying prompt.
+
+    ``ambiguous_prompt`` exists because the demonstration carries the answer. With
+    the demonstration erased, overwriting the prompt too would leave the sample
+    with neither and the target unlearnable.
+    """
+
+    def test_blanked_sample_keeps_the_rollouts_own_prompt(self):
+        d = _make(timestep_pad=True, zero_shot_prob=1.0)
+        assert d[0]["prompt"] != "Open the drawer."
+
+    def test_kept_sample_still_gets_the_ambiguous_prompt(self):
+        d = _make(timestep_pad=True, zero_shot_prob=0.0)
+        assert d[0]["prompt"] == "Open the drawer."
